@@ -62,6 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           export SDKROOT="$(xcrun --sdk appletvos --show-sdk-path)"
+          export TVOS_DEPLOYMENT_TARGET=17.0
           cargo +nightly build -Z build-std=std,panic_abort --target aarch64-apple-tvos --release
           xcodebuild -create-xcframework -library target/aarch64-apple-tvos/release/libstremiox_core.a -headers include -output ../app/Vendor/StremioXCore.xcframework
       - name: Generate Xcode project
@@ -71,7 +72,7 @@ jobs:
         working-directory: app
         run: |
           set -euo pipefail
-          xcodebuild -project StremioX.xcodeproj -scheme StremioXTV -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release -derivedDataPath build -skipPackagePluginValidation -skipMacroValidation CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO APPLETVOS_DEPLOYMENT_TARGET=17.0 build 2>&1 | tee "$RUNNER_TEMP/stremiox-tvos-build.log"
+          xcodebuild -project StremioX.xcodeproj -scheme StremioXTV -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release -derivedDataPath build -skipPackagePluginValidation -skipMacroValidation CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO TVOS_DEPLOYMENT_TARGET=17.0 build 2>&1 | tee "$RUNNER_TEMP/stremiox-tvos-build.log"
       - name: Package and verify Apple TV IPA
         run: |
           set -euo pipefail
@@ -80,6 +81,31 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms:0' "$APP/Info.plist")" = AppleTVOS
           mkdir -p out/Payload
           cp -R "$APP" out/Payload/
+          python3 - <<'PY'
+          import pathlib, plistlib, shutil, subprocess
+          app = pathlib.Path('out/Payload/StremioXTV.app')
+          info = plistlib.loads((app / 'Info.plist').read_bytes())
+          assert info['MinimumOSVersion'] == '17.0', info['MinimumOSVersion']
+          frameworks = list((app / 'Frameworks').glob('*.framework'))
+          binaries = [app / info['CFBundleExecutable']]
+          stubs = []
+          for framework in frameworks:
+              meta = plistlib.loads((framework / 'Info.plist').read_bytes())
+              if meta.get('MinimumOSVersion') == '100.0':
+                  stubs.append(framework)
+              else:
+                  binaries.append(framework / meta['CFBundleExecutable'])
+          dependencies = '\n'.join(subprocess.check_output(['otool', '-L', str(binary)], text=True) for binary in binaries)
+          # Xcode embeds empty placeholders for the statically linked MPVKit libraries.
+          # These carry a sentinel OS version and must not be shipped as runtime frameworks.
+          for framework in stubs:
+              assert f'@rpath/{framework.name}/' not in dependencies, framework
+              shutil.rmtree(framework)
+          print(f'Removed {len(stubs)} unused static framework placeholders')
+          for framework in (app / 'Frameworks').glob('*.framework'):
+              meta = plistlib.loads((framework / 'Info.plist').read_bytes())
+              assert tuple(map(int, meta.get('MinimumOSVersion', '0').split('.'))) <= (17, 0), framework
+          PY
           (cd out && zip -qry StremioX-tvOS.ipa Payload -x '*.DS_Store')
           rm -rf out/Payload
           shasum -a 256 out/StremioX-tvOS.ipa > out/SHA256SUMS.txt
