@@ -1,0 +1,100 @@
+name: Build StremioX Apple TV
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/tvos-build]
+    paths:
+      - '.github/workflows/build-tvos.yml'
+      - 'app/**'
+      - 'core/**'
+      - 'scripts/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tvos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          rustup toolchain install nightly --profile minimal --component rust-src
+          xcodebuild -version
+          xcrun --sdk appletvos --show-sdk-version
+      - name: Download tvOS runtime, streaming server and subtitle fonts
+        run: |
+          set -euo pipefail
+          verify() {
+            printf '%s  %s\n' "$2" "$1" | shasum -a 256 -c -
+          }
+          mkdir -p app/Vendor/nodejs-mobile app/Resources/fonts
+          curl -fL --retry 3 https://github.com/VortXTV/VortX/releases/download/vendor-1/NodeMobile-v18.20.4-ios-tvos.xcframework.zip -o "$RUNNER_TEMP/nodemobile.zip"
+          verify "$RUNNER_TEMP/nodemobile.zip" 6abd08685c35a2e4772533aeb8aab40483404ba184cb3b19a3e89f36376689bd
+          unzip -q "$RUNNER_TEMP/nodemobile.zip" -d app/Vendor/nodejs-mobile
+          curl -fL --retry 3 https://dl.strem.io/server/v4.21.0/desktop/server.js -o app/Resources/server.js
+          verify app/Resources/server.js 82175d7982bce864df071df93b4b3d567a401e65881a8ac579d7db0ce71dafd7
+          curl -fL --retry 3 https://github.com/VortXTV/VortX/releases/download/vendor-1/StremioX-subtitle-fonts-v2.zip -o "$RUNNER_TEMP/fonts.zip"
+          verify "$RUNNER_TEMP/fonts.zip" 11de005861655d43e53979325cdca3172951f93af566b6fc6778e6897dd53dbb
+          unzip -q "$RUNNER_TEMP/fonts.zip" -d app/Resources/fonts
+          python3 - <<'PY'
+          import pathlib, plistlib
+          p = pathlib.Path('app/Vendor/nodejs-mobile/NodeMobile.xcframework/Info.plist')
+          libraries = plistlib.loads(p.read_bytes())['AvailableLibraries']
+          assert any(x['SupportedPlatform'] == 'tvos' and 'SupportedPlatformVariant' not in x and 'arm64' in x['SupportedArchitectures'] for x in libraries), 'Missing tvOS device runtime'
+          PY
+      - name: Build Rust engine for Apple TV
+        working-directory: core
+        run: |
+          set -euo pipefail
+          export SDKROOT="$(xcrun --sdk appletvos --show-sdk-path)"
+          cargo +nightly build -Z build-std=std,panic_abort --target aarch64-apple-tvos --release
+          xcodebuild -create-xcframework -library target/aarch64-apple-tvos/release/libstremiox_core.a -headers include -output ../app/Vendor/StremioXCore.xcframework
+      - name: Generate Xcode project
+        working-directory: app
+        run: xcodegen generate
+      - name: Build unsigned tvOS app
+        working-directory: app
+        run: |
+          set -euo pipefail
+          xcodebuild -project StremioX.xcodeproj -scheme StremioXTV -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release -derivedDataPath build -skipPackagePluginValidation -skipMacroValidation CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO APPLETVOS_DEPLOYMENT_TARGET=17.0 build 2>&1 | tee "$RUNNER_TEMP/stremiox-tvos-build.log"
+      - name: Package and verify Apple TV IPA
+        run: |
+          set -euo pipefail
+          APP=app/build/Build/Products/Release-appletvos/StremioXTV.app
+          test -d "$APP"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms:0' "$APP/Info.plist")" = AppleTVOS
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          (cd out && zip -qry StremioX-tvOS.ipa Payload -x '*.DS_Store')
+          rm -rf out/Payload
+          shasum -a 256 out/StremioX-tvOS.ipa > out/SHA256SUMS.txt
+          git rev-parse HEAD > out/SOURCE_COMMIT.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StremioX-tvOS
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: StremioX-tvOS-diagnostics
+          path: ${{ runner.temp }}/stremiox-tvos-build.log
+          if-no-files-found: ignore
+          retention-days: 7
